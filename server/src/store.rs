@@ -17,9 +17,23 @@ pub struct DebateRecord {
     pub winner: Option<String>, // "bull" | "bear" | "draw"
 }
 
+pub const STARTING_POINTS: i64 = 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserProfile {
+    pub id: String,
+    pub name: String,
+    pub points: i64,
+    pub predictions: u64,
+    pub correct: u64,
+    pub created_at: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoreData {
     debates: HashMap<String, DebateRecord>,
+    #[serde(default)]
+    users: HashMap<String, UserProfile>,
 }
 
 pub struct Store {
@@ -50,6 +64,77 @@ impl Store {
         if let Ok(json) = serde_json::to_string_pretty(data) {
             let _ = std::fs::write(&self.path, json);
         }
+    }
+
+    pub fn create_user(&self, id: String, created_at: u64) -> UserProfile {
+        let mut data = self.data.lock().unwrap();
+        let user = data
+            .users
+            .entry(id.clone())
+            .or_insert_with(|| UserProfile {
+                name: format!("anon-{}", &id[..4.min(id.len())]),
+                id,
+                points: STARTING_POINTS,
+                predictions: 0,
+                correct: 0,
+                created_at,
+            })
+            .clone();
+        self.persist(&data);
+        user
+    }
+
+    pub fn get_user(&self, id: &str) -> Option<UserProfile> {
+        self.data.lock().unwrap().users.get(id).cloned()
+    }
+
+    pub fn set_user_name(&self, id: &str, name: String) -> Option<UserProfile> {
+        let mut data = self.data.lock().unwrap();
+        let user = data.users.get_mut(id)?;
+        user.name = name;
+        let out = user.clone();
+        self.persist(&data);
+        Some(out)
+    }
+
+    /// Atomically deducts points; returns the updated profile or None if
+    /// the user is unknown or has insufficient balance.
+    pub fn deduct_points(&self, id: &str, amount: i64) -> Option<UserProfile> {
+        let mut data = self.data.lock().unwrap();
+        let user = data.users.get_mut(id)?;
+        if user.points < amount {
+            return None;
+        }
+        user.points -= amount;
+        let out = user.clone();
+        self.persist(&data);
+        Some(out)
+    }
+
+    /// Applies stake settlement results: payout of 0 = lost stake.
+    pub fn settle_users(&self, results: &[(String, i64, bool)]) {
+        let mut data = self.data.lock().unwrap();
+        for (id, payout, won) in results {
+            if let Some(user) = data.users.get_mut(id) {
+                user.points += payout;
+                user.predictions += 1;
+                if *won {
+                    user.correct += 1;
+                }
+            }
+        }
+        self.persist(&data);
+    }
+
+    /// Refunds stakes (draw or aborted settlement) without counting a prediction.
+    pub fn refund_users(&self, refunds: &[(String, i64)]) {
+        let mut data = self.data.lock().unwrap();
+        for (id, amount) in refunds {
+            if let Some(user) = data.users.get_mut(id) {
+                user.points += amount;
+            }
+        }
+        self.persist(&data);
     }
 
     pub fn leaderboard(&self) -> Leaderboard {
@@ -93,6 +178,15 @@ impl Store {
         recent.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         recent.truncate(10);
 
+        let mut predictors: Vec<UserProfile> = data
+            .users
+            .values()
+            .filter(|u| u.predictions > 0)
+            .cloned()
+            .collect();
+        predictors.sort_by(|a, b| b.points.cmp(&a.points).then(b.correct.cmp(&a.correct)));
+        predictors.truncate(10);
+
         Leaderboard {
             coins,
             bull_wins,
@@ -100,6 +194,7 @@ impl Store {
             draws,
             total_debates: data.debates.len() as u64,
             recent,
+            predictors,
         }
     }
 }
@@ -123,4 +218,5 @@ pub struct Leaderboard {
     pub draws: u64,
     pub total_debates: u64,
     pub recent: Vec<DebateRecord>,
+    pub predictors: Vec<UserProfile>,
 }

@@ -106,6 +106,50 @@ export default function LeaderboardPage() {
         )}
       </section>
 
+      {/* Top predictors */}
+      <section className="rounded-2xl border border-panel-border bg-panel p-6">
+        <h2 className="mb-4 text-sm font-semibold uppercase tracking-widest text-foreground/50">
+          Top predictors
+        </h2>
+        {board.predictors.length === 0 ? (
+          <div className="py-8 text-center text-sm text-foreground/40">
+            No predictions settled yet — stake points on a live debate to get on the board.
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs uppercase tracking-wider text-foreground/40">
+                <th className="pb-3">#</th>
+                <th className="pb-3">Predictor</th>
+                <th className="pb-3 text-right">Points</th>
+                <th className="pb-3 text-right">Correct</th>
+                <th className="pb-3 text-right">Hit rate</th>
+              </tr>
+            </thead>
+            <tbody>
+              {board.predictors.map((u, i) => (
+                <tr key={u.id} className="border-t border-panel-border">
+                  <td className="py-3 text-foreground/40">{i + 1}</td>
+                  <td className="py-3 font-semibold">
+                    {i === 0 ? "👑 " : ""}
+                    {u.name}
+                  </td>
+                  <td className="py-3 text-right font-mono text-accent">
+                    ◆ {u.points.toLocaleString()}
+                  </td>
+                  <td className="py-3 text-right font-mono">
+                    {u.correct}/{u.predictions}
+                  </td>
+                  <td className="py-3 text-right font-mono">
+                    {((u.correct / u.predictions) * 100).toFixed(0)}%
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
       {/* Recent debates */}
       <section className="rounded-2xl border border-panel-border bg-panel p-6">
         <h2 className="mb-4 text-sm font-semibold uppercase tracking-widest text-foreground/50">

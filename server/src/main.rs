@@ -41,6 +41,38 @@ async fn leaderboard(State(app): State<Arc<AppState>>) -> Json<store::Leaderboar
     Json(app.store.leaderboard())
 }
 
+async fn create_user(State(app): State<Arc<AppState>>) -> Json<store::UserProfile> {
+    let id = uuid::Uuid::new_v4().to_string();
+    Json(app.store.create_user(id, market::now_secs()))
+}
+
+async fn get_user(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<store::UserProfile>, StatusCode> {
+    app.store.get_user(&id).map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(serde::Deserialize)]
+struct SetName {
+    name: String,
+}
+
+async fn set_user_name(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetName>,
+) -> Result<Json<store::UserProfile>, (StatusCode, String)> {
+    let name: String = req.name.trim().chars().take(24).collect();
+    if name.len() < 2 {
+        return Err((StatusCode::BAD_REQUEST, "name must be at least 2 characters".to_string()));
+    }
+    app.store
+        .set_user_name(&id, name)
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "unknown user".to_string()))
+}
+
 #[tokio::main]
 async fn main() {
     let llm = llm::LlmClient::from_env();
@@ -64,6 +96,11 @@ async fn main() {
         .route("/api/debates/{id}", get(debate::get_debate))
         .route("/api/debates/{id}/stream", get(debate::stream_debate))
         .route("/api/debates/{id}/vote", post(debate::vote))
+        .route("/api/debates/{id}/stake", post(debate::stake))
+        .route("/api/debates/{id}/stake/{user_id}", get(debate::get_stake))
+        .route("/api/users", post(create_user))
+        .route("/api/users/{id}", get(get_user))
+        .route("/api/users/{id}/name", post(set_user_name))
         .route("/api/leaderboard", get(leaderboard))
         .layer(CorsLayer::permissive())
         .with_state(state);

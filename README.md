@@ -54,7 +54,12 @@ If the backend runs elsewhere, set `NEXT_PUBLIC_API_URL` (e.g. in `web/.env.loca
 | GET    | `/api/debates/{id}`        | Full debate state                        |
 | GET    | `/api/debates/{id}/stream` | SSE stream (tokens, votes, status)       |
 | POST   | `/api/debates/{id}/vote`   | Vote `{argument_id, dir: "up"\|"down"}`  |
-| GET    | `/api/leaderboard`         | Coin engagement + Bull vs Bear win rates |
+| POST   | `/api/debates/{id}/stake`  | Stake points `{user_id, side, amount}`   |
+| GET    | `/api/debates/{id}/stake/{user_id}` | Your stake + payout after settle |
+| POST   | `/api/users`               | Create an anonymous user (1000 points)   |
+| GET    | `/api/users/{id}`          | User profile (points, prediction stats)  |
+| POST   | `/api/users/{id}/name`     | Set display name `{name}`                |
+| GET    | `/api/leaderboard`         | Coin + Bull/Bear stats + top predictors  |
 
 ## How a debate works
 
@@ -62,4 +67,13 @@ If the backend runs elsewhere, set `NEXT_PUBLIC_API_URL` (e.g. in `web/.env.loca
 2. The server fetches a live market snapshot and spawns the debate task.
 3. Each round: Bull speaks, then Bear — openings, then rebuttals that quote the opponent's last point, then closings.
 4. Tokens are broadcast over SSE; every viewer sees the same debate live, and late joiners catch up via a snapshot.
-5. Votes update the crowd sentiment meter in real time. When the debate ends, net approval per side decides the winner — and the verdict keeps shifting as votes come in.
+5. Votes update the crowd sentiment meter in real time. After the final argument a 45-second voting window opens; when it closes the verdict locks.
+
+## Prediction market
+
+Every visitor gets an anonymous profile with **1000 points** (stored in localStorage, no signup).
+
+- While a debate is **live**, stake 10–10,000 points on Bull or Bear (one stake per debate).
+- Staking locks when the arguments end; the crowd then has 45 seconds of final voting.
+- Settlement is **parimutuel**: winners get their stake back plus a pro-rata share of the losing pool. Draws refund everyone.
+- The leaderboard tracks the top predictors by points and hit rate.

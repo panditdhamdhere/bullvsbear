@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
+import PointsBadge from "@/components/PointsBadge";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -45,6 +46,7 @@ export default function RootLayout({
               <Link href="/leaderboard" className="transition hover:text-foreground">
                 Leaderboard
               </Link>
+              <PointsBadge />
             </nav>
           </div>
         </header>

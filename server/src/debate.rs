@@ -37,7 +37,30 @@ pub struct Argument {
 #[serde(rename_all = "lowercase")]
 pub enum DebateStatus {
     Live,
+    Voting,
     Finished,
+}
+
+/// Seconds the crowd gets to vote after the final argument before the
+/// verdict locks and stakes are settled.
+const VOTING_WINDOW_SECS: u64 = 45;
+
+const MIN_STAKE: i64 = 10;
+const MAX_STAKE: i64 = 10_000;
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct StakePools {
+    pub bull: i64,
+    pub bear: i64,
+    pub stakers: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Stake {
+    pub side: Side,
+    pub amount: i64,
+    pub payout: Option<i64>,
+    pub won: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +77,10 @@ pub struct DebateState {
     pub winner: Option<String>,
     pub created_at: u64,
     pub llm_powered: bool,
+    pub pools: StakePools,
+    pub voting_ends_at: Option<u64>,
+    #[serde(skip_serializing)]
+    pub stakes: HashMap<String, Stake>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -164,6 +191,9 @@ pub async fn create_debate(
         winner: None,
         created_at: now_secs(),
         llm_powered: app.llm.enabled(),
+        pools: StakePools::default(),
+        voting_ends_at: None,
+        stakes: HashMap::new(),
     };
 
     app.store.upsert(DebateRecord {
@@ -238,6 +268,9 @@ pub async fn vote(
         .ok_or((StatusCode::NOT_FOUND, "debate not found".to_string()))?;
 
     let mut state = room.state.write().await;
+    if state.status == DebateStatus::Finished {
+        return Err((StatusCode::CONFLICT, "voting is closed — the verdict is locked".to_string()));
+    }
     let arg = state
         .arguments
         .iter_mut()
@@ -252,10 +285,7 @@ pub async fn vote(
     let (arg_id, up, down) = (arg.id.clone(), arg.up, arg.down);
 
     state.sentiment = compute_sentiment(&state.arguments);
-    let (bull_net, bear_net, winner) = compute_winner(&state.arguments);
-    if state.status == DebateStatus::Finished {
-        state.winner = winner.clone();
-    }
+    let (bull_net, bear_net, _) = compute_winner(&state.arguments);
 
     app.store.upsert(DebateRecord {
         id: state.id.clone(),
@@ -281,6 +311,74 @@ pub async fn vote(
     let _ = room.tx.send(event.to_string());
 
     Ok(Json(json!({ "ok": true, "sentiment": state.sentiment })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StakeReq {
+    pub user_id: String,
+    pub side: String, // "bull" | "bear"
+    pub amount: i64,
+}
+
+pub async fn stake(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<StakeReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let side = match req.side.as_str() {
+        "bull" => Side::Bull,
+        "bear" => Side::Bear,
+        _ => return Err((StatusCode::BAD_REQUEST, "side must be 'bull' or 'bear'".to_string())),
+    };
+    if !(MIN_STAKE..=MAX_STAKE).contains(&req.amount) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("stake must be between {MIN_STAKE} and {MAX_STAKE} points"),
+        ));
+    }
+
+    let room = app
+        .debates
+        .get(&id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, "debate not found".to_string()))?;
+
+    let mut state = room.state.write().await;
+    if state.status != DebateStatus::Live {
+        return Err((StatusCode::CONFLICT, "staking closed — the debate is over".to_string()));
+    }
+    if state.stakes.contains_key(&req.user_id) {
+        return Err((StatusCode::CONFLICT, "you already staked on this debate".to_string()));
+    }
+
+    let user = app.store.deduct_points(&req.user_id, req.amount).ok_or((
+        StatusCode::BAD_REQUEST,
+        "unknown user or insufficient points".to_string(),
+    ))?;
+
+    state.stakes.insert(
+        req.user_id.clone(),
+        Stake { side, amount: req.amount, payout: None, won: None },
+    );
+    match side {
+        Side::Bull => state.pools.bull += req.amount,
+        Side::Bear => state.pools.bear += req.amount,
+    }
+    state.pools.stakers += 1;
+    let pools = state.pools;
+
+    let _ = room.tx.send(json!({ "type": "stake", "pools": pools }).to_string());
+
+    Ok(Json(json!({ "ok": true, "pools": pools, "points": user.points })))
+}
+
+pub async fn get_stake(
+    State(app): State<Arc<AppState>>,
+    Path((id, user_id)): Path<(String, String)>,
+) -> Result<Json<Stake>, StatusCode> {
+    let room = app.debates.get(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let state = room.state.read().await;
+    state.stakes.get(&user_id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 // ---------------------------------------------------------------------------
@@ -317,11 +415,32 @@ async fn run_debate(app: Arc<AppState>, room: Arc<DebateRoom>) {
         }
     }
 
+    // Voting window: arguments are done, the crowd gets a final chance to
+    // vote before the verdict locks and stakes settle.
+    let voting_ends_at = now_secs() + VOTING_WINDOW_SECS;
+    {
+        let mut s = room.state.write().await;
+        s.status = DebateStatus::Voting;
+        s.voting_ends_at = Some(voting_ends_at);
+        let _ = room.tx.send(
+            json!({
+                "type": "status",
+                "status": "voting",
+                "voting_ends_at": voting_ends_at,
+                "sentiment": s.sentiment,
+            })
+            .to_string(),
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(VOTING_WINDOW_SECS)).await;
+
     let mut s = room.state.write().await;
     s.status = DebateStatus::Finished;
     let (bull_net, bear_net, winner) = compute_winner(&s.arguments);
     s.winner = winner.clone();
     s.sentiment = compute_sentiment(&s.arguments);
+
+    settle_stakes(&app, &mut s, winner.as_deref());
 
     app.store.upsert(DebateRecord {
         id: s.id.clone(),
@@ -337,9 +456,58 @@ async fn run_debate(app: Arc<AppState>, room: Arc<DebateRoom>) {
     });
 
     let _ = room.tx.send(
-        json!({ "type": "status", "status": "finished", "winner": winner, "sentiment": s.sentiment })
-            .to_string(),
+        json!({
+            "type": "settled",
+            "winner": winner,
+            "sentiment": s.sentiment,
+            "pools": s.pools,
+        })
+        .to_string(),
     );
+}
+
+/// Parimutuel settlement: winners split the losing pool pro-rata to their
+/// stake. Draws (or a one-sided pool) refund everyone.
+fn settle_stakes(app: &Arc<AppState>, s: &mut DebateState, winner: Option<&str>) {
+    if s.stakes.is_empty() {
+        return;
+    }
+
+    let winning_side = match winner {
+        Some("bull") => Some(Side::Bull),
+        Some("bear") => Some(Side::Bear),
+        _ => None,
+    };
+    let (win_pool, lose_pool) = match winning_side {
+        Some(Side::Bull) => (s.pools.bull, s.pools.bear),
+        Some(Side::Bear) => (s.pools.bear, s.pools.bull),
+        None => (0, 0),
+    };
+
+    if winning_side.is_none() || win_pool == 0 {
+        let refunds: Vec<(String, i64)> =
+            s.stakes.iter().map(|(id, st)| (id.clone(), st.amount)).collect();
+        for st in s.stakes.values_mut() {
+            st.payout = Some(st.amount);
+            st.won = None; // refunded, not counted as a prediction
+        }
+        app.store.refund_users(&refunds);
+        return;
+    }
+
+    let mut results: Vec<(String, i64, bool)> = Vec::with_capacity(s.stakes.len());
+    for (id, st) in s.stakes.iter_mut() {
+        let won = Some(st.side) == winning_side;
+        let payout = if won {
+            st.amount + st.amount * lose_pool / win_pool
+        } else {
+            0
+        };
+        st.payout = Some(payout);
+        st.won = Some(won);
+        results.push((id.clone(), payout, won));
+    }
+    app.store.settle_users(&results);
 }
 
 async fn speak(

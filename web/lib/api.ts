@@ -44,19 +44,43 @@ export type Sentiment = {
   total_votes: number;
 };
 
+export type StakePools = {
+  bull: number;
+  bear: number;
+  stakers: number;
+};
+
+export type Stake = {
+  side: Side;
+  amount: number;
+  payout: number | null;
+  won: boolean | null;
+};
+
+export type UserProfile = {
+  id: string;
+  name: string;
+  points: number;
+  predictions: number;
+  correct: number;
+  created_at: number;
+};
+
 export type DebateState = {
   id: string;
   coin_id: string;
   coin_symbol: string;
   coin_name: string;
   rounds_total: number;
-  status: "live" | "finished";
+  status: "live" | "voting" | "finished";
   market: MarketSnapshot;
   arguments: Argument[];
   sentiment: Sentiment;
   winner: string | null;
   created_at: number;
   llm_powered: boolean;
+  pools: StakePools;
+  voting_ends_at: number | null;
 };
 
 export type DebateEvent =
@@ -75,7 +99,14 @@ export type DebateEvent =
       sentiment: Sentiment;
       winner: string | null;
     }
-  | { type: "status"; status: "finished"; winner: string | null; sentiment: Sentiment };
+  | { type: "status"; status: "voting"; voting_ends_at: number; sentiment: Sentiment }
+  | { type: "stake"; pools: StakePools }
+  | {
+      type: "settled";
+      winner: string | null;
+      sentiment: Sentiment;
+      pools: StakePools;
+    };
 
 export type CoinStats = {
   coin_id: string;
@@ -107,6 +138,7 @@ export type Leaderboard = {
   draws: number;
   total_debates: number;
   recent: DebateRecord[];
+  predictors: UserProfile[];
 };
 
 export async function fetchCoins(): Promise<CoinInfo[]> {
@@ -150,6 +182,42 @@ export async function sendVote(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ argument_id: argumentId, dir }),
   });
+}
+
+export async function createUser(): Promise<UserProfile> {
+  const res = await fetch(`${API_BASE}/api/users`, { method: "POST" });
+  if (!res.ok) throw new Error("failed to create user");
+  return res.json();
+}
+
+export async function fetchUser(id: string): Promise<UserProfile> {
+  const res = await fetch(`${API_BASE}/api/users/${id}`);
+  if (!res.ok) throw new Error("unknown user");
+  return res.json();
+}
+
+export async function placeStake(
+  debateId: string,
+  userId: string,
+  side: Side,
+  amount: number,
+): Promise<{ ok: boolean; pools: StakePools; points: number }> {
+  const res = await fetch(`${API_BASE}/api/debates/${debateId}/stake`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, side, amount }),
+  });
+  if (!res.ok) throw new Error((await res.text()) || "stake failed");
+  return res.json();
+}
+
+export async function fetchMyStake(
+  debateId: string,
+  userId: string,
+): Promise<Stake | null> {
+  const res = await fetch(`${API_BASE}/api/debates/${debateId}/stake/${userId}`);
+  if (!res.ok) return null;
+  return res.json();
 }
 
 export async function fetchLeaderboard(): Promise<Leaderboard> {

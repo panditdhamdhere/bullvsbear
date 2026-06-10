@@ -7,10 +7,15 @@ import {
   Argument,
   DebateEvent,
   DebateState,
+  Side,
+  Stake,
+  fetchMyStake,
   fmtBig,
   fmtPrice,
+  placeStake,
   sendVote,
 } from "@/lib/api";
+import { notifyPointsChanged, useUser } from "@/lib/user";
 
 export default function DebatePage({
   params,
@@ -84,8 +89,18 @@ export default function DebatePage({
             return {
               ...prev,
               status: ev.status,
+              voting_ends_at: ev.voting_ends_at,
+              sentiment: ev.sentiment,
+            };
+          case "stake":
+            return { ...prev, pools: ev.pools };
+          case "settled":
+            return {
+              ...prev,
+              status: "finished",
               winner: ev.winner,
               sentiment: ev.sentiment,
+              pools: ev.pools,
             };
           default:
             return prev;
@@ -142,6 +157,10 @@ export default function DebatePage({
             <span className="flex items-center gap-1.5 rounded-full bg-bear/15 px-3 py-1 font-semibold text-bear">
               <span className="h-2 w-2 animate-pulse rounded-full bg-bear" /> LIVE
             </span>
+          ) : debate.status === "voting" ? (
+            <span className="flex items-center gap-1.5 rounded-full bg-accent/15 px-3 py-1 font-semibold text-accent">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-accent" /> VOTING OPEN
+            </span>
           ) : (
             <span className="rounded-full bg-foreground/10 px-3 py-1 font-semibold text-foreground/60">
               FINISHED
@@ -161,8 +180,16 @@ export default function DebatePage({
       {/* Sentiment meter */}
       <SentimentMeter debate={debate} />
 
+      {/* Voting window countdown */}
+      {debate.status === "voting" && (
+        <VotingCountdown endsAt={debate.voting_ends_at} />
+      )}
+
       {/* Winner banner */}
       {debate.status === "finished" && <WinnerBanner debate={debate} />}
+
+      {/* Prediction market */}
+      <StakePanel debate={debate} />
 
       {/* Fighters */}
       <div className="grid grid-cols-2 gap-4 text-center text-sm">
@@ -191,7 +218,12 @@ export default function DebatePage({
             </div>
             <div className="flex flex-col gap-4">
               {args.map((a) => (
-                <ArgumentCard key={a.id} arg={a} onVote={vote} />
+                <ArgumentCard
+                  key={a.id}
+                  arg={a}
+                  onVote={vote}
+                  votingOpen={debate.status !== "finished"}
+                />
               ))}
             </div>
           </section>
@@ -285,8 +317,212 @@ function WinnerBanner({ debate }: { debate: DebateState }) {
     <div className={`rounded-2xl border px-5 py-4 text-center text-lg font-bold ${cfg.cls}`}>
       {cfg.text}
       <div className="mt-1 text-xs font-normal text-foreground/50">
-        Keep voting — the verdict shifts with the crowd.
+        Verdict locked by the crowd vote. Stakes have been settled.
       </div>
+    </div>
+  );
+}
+
+function VotingCountdown({ endsAt }: { endsAt: number | null }) {
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const remaining = Math.max(0, (endsAt ?? 0) - now);
+  return (
+    <div className="rounded-2xl border border-accent/40 bg-accent/10 px-5 py-4 text-center">
+      <span className="font-bold text-accent">
+        Final votes! Verdict locks in {remaining}s
+      </span>
+      <div className="mt-1 text-xs text-foreground/50">
+        Vote on the arguments below — then the winner is declared and stakes pay out.
+      </div>
+    </div>
+  );
+}
+
+const STAKE_AMOUNTS = [25, 50, 100, 250];
+
+function StakePanel({ debate }: { debate: DebateState }) {
+  const { user, setUser } = useUser();
+  const [myStake, setMyStake] = useState<Stake | null>(null);
+  const [side, setSide] = useState<Side>("bull");
+  const [amount, setAmount] = useState(50);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const settled = debate.status === "finished";
+
+  useEffect(() => {
+    if (!user) return;
+    fetchMyStake(debate.id, user.id).then(setMyStake);
+  }, [user?.id, debate.id]);
+
+  // Refetch after settlement to learn the payout, and refresh the points badge.
+  useEffect(() => {
+    if (!settled || !user) return;
+    fetchMyStake(debate.id, user.id).then((s) => {
+      setMyStake(s);
+      if (s) notifyPointsChanged();
+    });
+  }, [settled, user?.id, debate.id]);
+
+  if (!user) return null;
+
+  async function submit() {
+    if (!user || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await placeStake(debate.id, user.id, side, amount);
+      setMyStake({ side, amount, payout: null, won: null });
+      setUser({ ...user, points: res.points });
+      notifyPointsChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "stake failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const { bull, bear, stakers } = debate.pools;
+  const total = bull + bear;
+
+  return (
+    <div className="rounded-2xl border border-accent/30 bg-panel px-5 py-4">
+      <div className="mb-3 flex items-center justify-between text-xs font-semibold uppercase tracking-widest text-foreground/40">
+        <span>Prediction market</span>
+        <span>
+          pool ◆ {total.toLocaleString()} · {stakers} staker{stakers === 1 ? "" : "s"}
+        </span>
+      </div>
+
+      {/* Pool split */}
+      {total > 0 && (
+        <div className="mb-4 flex items-center gap-3 text-xs font-semibold">
+          <span className="text-bull">◆ {bull.toLocaleString()}</span>
+          <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-foreground/10">
+            <div
+              className="absolute inset-y-0 left-0 bg-bull transition-all duration-500"
+              style={{ width: `${total > 0 ? (bull / total) * 100 : 50}%` }}
+            />
+            <div
+              className="absolute inset-y-0 right-0 bg-bear transition-all duration-500"
+              style={{ width: `${total > 0 ? (bear / total) * 100 : 50}%` }}
+            />
+          </div>
+          <span className="text-bear">◆ {bear.toLocaleString()}</span>
+        </div>
+      )}
+
+      {myStake ? (
+        <StakeResult stake={myStake} settled={settled} winner={debate.winner} />
+      ) : debate.status === "live" ? (
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex gap-2">
+            <button
+              onClick={() => setSide("bull")}
+              className={`rounded-lg border px-4 py-2 text-sm font-bold transition ${
+                side === "bull"
+                  ? "border-bull bg-bull/15 text-bull"
+                  : "border-panel-border text-foreground/50 hover:border-bull/50"
+              }`}
+            >
+              🐂 Bull
+            </button>
+            <button
+              onClick={() => setSide("bear")}
+              className={`rounded-lg border px-4 py-2 text-sm font-bold transition ${
+                side === "bear"
+                  ? "border-bear bg-bear/15 text-bear"
+                  : "border-panel-border text-foreground/50 hover:border-bear/50"
+              }`}
+            >
+              🐻 Bear
+            </button>
+          </div>
+          <div className="flex gap-1.5">
+            {STAKE_AMOUNTS.map((a) => (
+              <button
+                key={a}
+                onClick={() => setAmount(a)}
+                disabled={a > user.points}
+                className={`rounded-lg border px-3 py-2 font-mono text-xs font-bold transition disabled:opacity-30 ${
+                  amount === a
+                    ? "border-accent bg-accent/15 text-accent"
+                    : "border-panel-border text-foreground/50 hover:border-foreground/30"
+                }`}
+              >
+                {a}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={submit}
+            disabled={busy || amount > user.points}
+            className="rounded-lg bg-accent px-5 py-2 text-sm font-bold text-background transition enabled:hover:brightness-110 disabled:opacity-40"
+          >
+            {busy ? "Staking…" : `Stake ◆${amount}`}
+          </button>
+          <span className="text-xs text-foreground/40">
+            Winners split the losing pool. Locks when arguments end.
+          </span>
+          {error && <span className="w-full text-xs text-bear">{error}</span>}
+        </div>
+      ) : (
+        <div className="text-sm text-foreground/50">
+          {settled
+            ? "Staking closed — this market has settled."
+            : "Staking closed — waiting for the verdict."}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StakeResult({
+  stake,
+  settled,
+  winner,
+}: {
+  stake: Stake;
+  settled: boolean;
+  winner: string | null;
+}) {
+  const sideLabel = stake.side === "bull" ? "🐂 Bull" : "🐻 Bear";
+
+  if (!settled || stake.payout === null) {
+    return (
+      <div className="text-sm">
+        You staked <span className="font-bold text-accent">◆{stake.amount}</span> on{" "}
+        <span className={`font-bold ${stake.side === "bull" ? "text-bull" : "text-bear"}`}>
+          {sideLabel}
+        </span>
+        {" — "}
+        <span className="text-foreground/50">good luck.</span>
+      </div>
+    );
+  }
+
+  if (stake.won === null || winner === "draw") {
+    return (
+      <div className="text-sm">
+        Draw — your <span className="font-bold text-accent">◆{stake.amount}</span> stake was
+        refunded.
+      </div>
+    );
+  }
+
+  return stake.won ? (
+    <div className="text-sm font-bold text-bull">
+      You called it! {sideLabel} won — paid out ◆{stake.payout.toLocaleString()} (
+      +{(stake.payout - stake.amount).toLocaleString()} profit).
+    </div>
+  ) : (
+    <div className="text-sm font-bold text-bear">
+      Wrong call — {sideLabel} lost. ◆{stake.amount} gone. Better luck next debate.
     </div>
   );
 }
@@ -294,9 +530,11 @@ function WinnerBanner({ debate }: { debate: DebateState }) {
 function ArgumentCard({
   arg,
   onVote,
+  votingOpen,
 }: {
   arg: Argument;
   onVote: (id: string, dir: "up" | "down") => void;
+  votingOpen: boolean;
 }) {
   const isBull = arg.side === "bull";
   const [pop, setPop] = useState<"up" | "down" | null>(null);
@@ -334,7 +572,8 @@ function ArgumentCard({
           <div className="mt-3 flex items-center gap-2">
             <button
               onClick={() => handleVote("up")}
-              className={`flex items-center gap-1.5 rounded-full border border-panel-border bg-background/50 px-3 py-1.5 text-sm transition hover:border-bull/50 hover:bg-bull/10 ${
+              disabled={!votingOpen}
+              className={`flex items-center gap-1.5 rounded-full border border-panel-border bg-background/50 px-3 py-1.5 text-sm transition enabled:hover:border-bull/50 enabled:hover:bg-bull/10 disabled:opacity-50 ${
                 pop === "up" ? "vote-pop" : ""
               }`}
             >
@@ -342,7 +581,8 @@ function ArgumentCard({
             </button>
             <button
               onClick={() => handleVote("down")}
-              className={`flex items-center gap-1.5 rounded-full border border-panel-border bg-background/50 px-3 py-1.5 text-sm transition hover:border-bear/50 hover:bg-bear/10 ${
+              disabled={!votingOpen}
+              className={`flex items-center gap-1.5 rounded-full border border-panel-border bg-background/50 px-3 py-1.5 text-sm transition enabled:hover:border-bear/50 enabled:hover:bg-bear/10 disabled:opacity-50 ${
                 pop === "down" ? "vote-pop" : ""
               }`}
             >
